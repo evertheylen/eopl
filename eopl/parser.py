@@ -4,6 +4,8 @@ from itertools import chain
 import re
 from dataclasses import dataclass
 
+from eopl.util import multimap, NotFlat
+
 
 # Tokens (bunch of regex's)
 # =========================================================
@@ -14,7 +16,8 @@ class Token:
         return cls(token)
 
 
-class _EOS(Token): pass
+class _EOS(Token):
+    __str__ = __repr__ = lambda s: "<EOS>"
 EOS = _EOS()
 
 
@@ -30,11 +33,11 @@ class Constant(Token):
 
 
 
-class Integer(Constant):
+class ConstInteger(Constant):
     TYPE = int
     regex = r'[0-9]+'
 
-class Boolean(Constant):
+class ConstBoolean(Constant):
     TYPE = bool
     regex = r'(true|false)'
     
@@ -42,7 +45,7 @@ class Boolean(Constant):
     def tokenize(cls, scanner, token):
         return cls(token == 'true')
 
-class String(Constant):
+class ConstString(Constant):
     TYPE = str
     regex = r'"(.*)"'
     
@@ -61,24 +64,86 @@ class Punctuation(Token, str):
     regex = r'[\(\),\-+*/=]'
 
 
-all_tokens = [Integer, Boolean, String, Symbol, Punctuation]
+_all_tokens = [ConstInteger, ConstBoolean, ConstString, Symbol, Punctuation]
 
-scanner = re.Scanner(
-    [(cls.regex, cls.tokenize) for cls in all_tokens] + [
+_scanner = re.Scanner(
+    [(cls.regex, cls.tokenize) for cls in _all_tokens] + [
         (r'\s+', None),    # whitespace
         (r'%.*\n', None),  # comment
     ]
 )
 
 
+class TokenString(tuple):
+    def __str__(self):
+        if len(self) == 0: return "ε"
+        return "`" + " ".join([str(i) for i in self]) + "`"
+    
+    __repr__ = __str__
+    
+    def __add__(self, other):
+        return TokenString(tuple(self) + tuple(other))
+    
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return TokenString(super().__getitem__(key))
+        return super().__getitem__(key)
+
+
+epsilon = TokenString([])  # empty string
+
+
+def tokenize(text: str) -> TokenString:
+    raw_tokens, rest = _scanner.scan(text)
+    if len(rest) != 0:
+        raise Exception(f"Untokenized text remains: {rest!r}")
+    return TokenString(raw_tokens)
+    
+
 
 # Grammar
 # =========================================================
 
+
 class Grammar:
-    def __init__(self, rules):
-        self.rules = rules
-        # TODO?
+    def __init__(self, V, T, P, S):
+        self.V = V  # Variables
+        self.T = T  # Terminals
+        self.P = P  # Productions
+        self.S = S  # Start Variable
+        assert S in V
+        for var, string in P.flat_items():
+            assert var in V
+            for symb in string:
+                assert symb in self.symbols, f"{symb} not in {self.symbols}"
+        assert len(V & T) == 0, "The intersection of V and T must be empty"
+    
+    def __str__(self):
+        s =  "Variables = " + ", ".join(map(str, sorted(self.V))) + "\n"
+        s += "Terminals = " + ", ".join(map(str, sorted(self.T))) + "\n"
+        s += "Productions = {\n"
+        for var in sorted(self.V):
+            for string in sorted(self.P[var]):
+                s += f"    {var} \t-> {string}\n"
+        s += "}\n"
+        s += f"Start = {self.S}"
+        return s
+    
+    @property
+    def invP(self):
+        if not hasattr(self, "_invP"):
+            # Inverse of P
+            self._invP = multimap()
+            for var, string in self.P.flat_items():
+                self._invP[string].add(var)
+        return self._invP
+    
+    @property
+    def symbols(self):
+        if not hasattr(self, "_symbols"):
+            self._symbols = self.V | self.T
+        return self._symbols
+    
 
 
 def double(it):
@@ -90,7 +155,7 @@ class ParserSet:
     def _init_dict(self):
         self.dct = defaultdict(set)
     
-    def __init__(self, grammar):
+    def __init__(self, G: Grammar):
         self.G = G
         self._init_dict()
         
@@ -105,7 +170,7 @@ class ParserSet:
     
     def print_vars(self):
         for var in sorted(self.G.V):
-            eprint("    {}: {}".format(var, oset(self.dct[var])))
+            print("    {}: {}".format(var, oset(self.dct[var])))
 
 
 class FIRST(ParserSet):
@@ -119,7 +184,7 @@ class FIRST(ParserSet):
         if what in self.dct:
             return self.dct[what]
         
-        assert isinstance(what, String)
+        assert isinstance(what, TokenString)
         
         if len(what) == 1:
             return self(what[0])  # Important :)
@@ -172,19 +237,19 @@ class FOLLOW(ParserSet):
     
 
 class LLParser:
-    def __init__(self, G: Grammar, debug = True):
+    def __init__(self, G: Grammar, debug = False):
         self.G = G
         
         if debug:
-            eprint(">>> Builing LL(1) Table")
+            print(">>> Builing LL(1) Table")
         
         first = FIRST(G)
         follow = FOLLOW(G, first=first)
         
         if debug:
-            eprint(" >> FIRST:")
+            print(" >> FIRST:")
             first.print_vars()
-            eprint(" >> FOLLOW:")
+            print(" >> FOLLOW:")
             follow.print_vars()
         
         table = defaultdict(multimap)
@@ -198,10 +263,9 @@ class LLParser:
                     table[var][symb].add(string)
         
         try:
-            self.table = {k: defaultdict(lambda: None, v.flatten()) for k, v in table.items()}
-            eprint(">>> Table is built.\n")
+            self.table = {k: v.flatten() for k, v in table.items()}
+            print(">>> Table is built.\n")
         except NotFlat as e:
-            #print("!!! Warning: Language is not LL(1)")
             raise Exception("Language is not LL(1)") from e
     
         
@@ -224,8 +288,7 @@ class LLParser:
             c = _c + 1
             for _r, var in enumerate(variables):
                 r = _r + 1
-                cell = self.table[var][term]
-                columns[c][r] = str(cell) if cell is not None else ""
+                columns[c][r] = str(self.table[var].get(term, ""))
         
         col_lengths = [max(map(len, ln)) for ln in columns]
         
@@ -247,49 +310,87 @@ class LLParser:
         
         return "\n".join(lines)
     
-    def parse(self, _s: str):
-        s = list(_s) + [EOS]
-        tree = self._parse(s, self.G.S)
-        if s != [EOS]:
+    def parse(self, s: TokenString):
+        to_parse = list(s) + [EOS]
+        parsed = []
+        tree = self._parse(to_parse, parsed, self.G.S)
+        if to_parse != [EOS]:
             raise Exception("Not all input was processed")
         return tree
     
-    def _parse(self, s, var):
+    def _parse(self, to_parse, parsed, var):
         children = []
-        string = self.table[var][s[0]]
+        string = self.table[var].get(to_parse[0])
+        if string is None:
+            raise Exception(f"String did not satisfy language (variable {var}, already parsed {parsed})")
         for symb in string:
             if symb in self.G.T:
                 children.append(symb)
-                s.pop(0)
+                parsed.append(to_parse.pop(0))
             else:
-                children.append(self._parse(s, symb))
+                children.append(self._parse(to_parse, parsed, symb))
         return Tree(var, children)
+
+
+class Tree:
+    def __init__(self, content, children = []):
+        self.content = content
+        self.children = children
     
+    def __str__(self):
+        return "(" + str(self.content) + " " + " ".join(map(str, self.children)) + ")"
+
 
 if __name__ == "__main__":
+    
+    print("TOKENIZE")
+    print(tokenize("if iszero? (x) then let x = 1 in x + 1 else x + (x * 2)"))
+    
+    def Str(*l):
+        return TokenString(l)
+    
     #G = Grammar({"S", "M", "N"}, {"a", "b", "z"},
             #multimap({"S": {String("zMNz")}, "M": {String("aMa"), String("z")}, "N": {String("bNb"), String("z")}}), "S")
     
     #G = Grammar({"S"}, {"x", "y"},
             #multimap({"S": {String("xSy"), epsilon}}), "S")
+            
+    # E -> ( E )
+    # E -> id
+    # S -> E + E
+    # E -> S
+    # M -> E * E
+    # E -> M
     
-    G = Grammar.load("/Bestanden/School/MB/voorbeelden/per-topic/LL1/Grune_8.2.4.json")
     
-    #G = Grammar({"E", "E'", "T", "T'", "F"}, {"+", "*", "(", ")", "id"},
-            #multimap({"E": {Str("T", "E'")}, "E'": {Str("+", "T", "E'"), epsilon}, 
-                      #"T": {Str("F", "T'")}, "T'": {Str("*", "F", "T'"), epsilon},
-                      #"F": {Str("(", "E", ")"), Str("id")} }), "E")
-    #fi = FIRST(G)
-    #print("FIRST")
-    #fi.print_vars()
-    #print()
-    #fw = FOLLOW(G, first=fi)
-    #fw.print_vars()
+    grammar = r"""
+    E: '(' E ')' | S | M | number;
+    S: E '+' E {left, 1};
+    M: E '*' E {left, 2};
+    
+    terminals
+    number: /\d+/;
+    """
+    
+    from parglare import Parser, Grammar
+    
+    g = Grammar.from_string(grammar)
+    parser = Parser(g)
+    res = parser.parse("34 + 2 * 4")
+    print("RESULT", res)
+    
+    """
+    P = multimap({
+        "E": {Str("(", "E", ")"), Str("id"), Str("S"), Str("M")},
+        "S": {Str("E", "+", "E")},
+        "M": {Str("E", "*", "E")},
+    })
+    
+    G = Grammar({"E", "S", "M"}, {"+", "*", "(", ")", "id"}, P, "E")
     
     print(G)
     parser = LLParser(G)
     print(parser)
-    #tree = parser.parse("zaazaabbzbbz")
-    #tree.save("test.dot")
-    #print(tree)
-    #print(tree.terminal_yield())
+    tree = parser.parse(Str("id", "+", "id", "*", "id"))
+    print(tree)
+    """
