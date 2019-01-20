@@ -11,7 +11,8 @@ from parglare.grammar import Production, ProductionRHS, Terminal, NonTerminal, G
 
 from eopl.util import multimap
 
-__all__ = ('Field', 'skip', 'generates', 'replaces', 'Number', 'Boolean', 'String', 'Language')
+__all__ = ('Field', 'skip', 'THIS', 'generates', 'replaces', 
+           'Number', 'Boolean', 'String', 'RawIdentifier', 'Language')
 
 
 # Declare Grammar
@@ -55,11 +56,13 @@ def add_tags(cls):
         cls._fields = None
 
 
+THIS = None
+
 def skip(*symbols, **kwargs):
     def f(cls):
         add_tags(cls)
         if symbols.count(None) != 1:
-            raise Exception("@skip needs exactly one mention of 'None'")
+            raise Exception("@skip needs exactly one mention of 'None' aka THIS")
         index = symbols.index(None)
         cls._productions.append(AbstractProduction(
             head=cls,
@@ -113,14 +116,16 @@ def replaces(from_cls, **kwargs):
 # ===============================================
 
 _default_actions = {
-    'Number': lambda _, nodes: int(nodes[0]),
-    'Boolean': lambda _, nodes: nodes[0] == 'true',
-    'String': lambda _, nodes: nodes[0][1:-1],
+    'Number': lambda _, s: int(s),
+    'Boolean': lambda _, s: s == 'true',
+    'String': lambda _, s: s[1:-1],
+    'RawIdentifier': lambda _, s: s
 }
 
 Number = Terminal('Number', RegExRecognizer(r"\d+"))
 Boolean = Terminal('Boolean', RegExRecognizer(r"(true|false)"))
 String = Terminal('String', RegExRecognizer(r'".*"'))
+RawIdentifier = Terminal('RawIdentifier', RegExRecognizer(r'[A-Za-z_][A-Za-z0-9_]*'))
 
 _comment = Terminal('_comment', RegExRecognizer(r"%.*\n"))
 
@@ -132,22 +137,20 @@ _layout_prods = [
     Production(LAYOUT_ITEM, ProductionRHS([EMPTY])),
 ]
 
-_default_symbols = [Number, Boolean, String, _comment]
+_default_symbols = [Number, Boolean, String, RawIdentifier, _comment]
 
 
 
-# Build the parglare grammar
+# Make an actual language!
 # =========================================================
 
 
 class Language:
-    def __init__(self, start, *types):
-        self.start = start
+    def __init__(self, *types):
+        self.start = types[0]
         self.types = list(types)
-        if start not in self.types:
-            self.types.append(start)
             
-        self.grammar, self.actions = self.make_grammar(start, self.types)
+        self.grammar, self.actions = self.make_grammar(self.start, self.types)
         self.parser = Parser(self.grammar, actions=self.actions)
     
     @staticmethod
