@@ -1,34 +1,36 @@
 
+from eopl.parser import *
+
 @skip('(', None, ')')
 class Expression:
     pass
 
-# E -> ( E )
 
-
-@generates(Field('a', Expression), '+', Field('b', Expression))
+@generates(Field('a', Expression), '+', Field('b', Expression), assoc='left', priority=1200)
 @replaces(Expression)
 class Summation:
-    pass
-
-# S -> E + E
-# E -> S
+    def evaluate(self):
+        return self.a.evaluate() + self.b.evaluate()
 
     
-@generates(Field('a', Expression), '*', Field('b', Expression))
+@generates(Field('a', Expression), '*', Field('b', Expression), assoc='left', priority=1100)
 @replaces(Summation)
 class Multiplication:
-    pass
+    def evaluate(self):
+        return self.a.evaluate() * self.b.evaluate()
 
-# M -> E * E
-# E -> M
-
-
-@rule(Symbol("zero?"), "(", Field('expr', Expression), ")")
-class IsZero(Expression):
-    pass
+    
+@generates(Field('val', Number))
+@replaces(Expression)
+class Constant:
+    def evaluate(self):
+        return self.val
     
 
-@rule
-class Program:
-    expr: Expression
+MATH = Language(Expression, Summation, Multiplication, Constant)
+
+
+if __name__ == "__main__":
+    expr = MATH.parse("5 + 3 * 2")
+    print(expr)
+    print(expr.evaluate())

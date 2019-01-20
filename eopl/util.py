@@ -33,12 +33,3 @@ class multimap(defaultdict):
                 raise NotFlat(v)
             d[k] = v.pop()
         return d
-
-
-class NotFlat(Exception):
-    def __init__(self, content, *a, **kw):
-        self.content = content
-        super().__init__(*a, **kw)
-
-    def __str__(self):
-        return "The set {} is not of length 1.".format(self.content)
