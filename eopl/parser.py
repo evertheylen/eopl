@@ -16,11 +16,6 @@ class Token:
         return cls(token)
 
 
-class _EOS(Token):
-    __str__ = __repr__ = lambda s: "<EOS>"
-EOS = _EOS()
-
-
 class Constant(Token):
     def __init__(self, value):
         self.value = self.TYPE(value)
@@ -90,270 +85,27 @@ class TokenString(tuple):
         return super().__getitem__(key)
 
 
-epsilon = TokenString([])  # empty string
-
-
-def tokenize(text: str) -> TokenString:
-    raw_tokens, rest = _scanner.scan(text)
-    if len(rest) != 0:
-        raise Exception(f"Untokenized text remains: {rest!r}")
-    return TokenString(raw_tokens)
-    
-
 
 # Grammar
 # =========================================================
 
 
-class Grammar:
-    def __init__(self, V, T, P, S):
-        self.V = V  # Variables
-        self.T = T  # Terminals
-        self.P = P  # Productions
-        self.S = S  # Start Variable
-        assert S in V
-        for var, string in P.flat_items():
-            assert var in V
-            for symb in string:
-                assert symb in self.symbols, f"{symb} not in {self.symbols}"
-        assert len(V & T) == 0, "The intersection of V and T must be empty"
-    
-    def __str__(self):
-        s =  "Variables = " + ", ".join(map(str, sorted(self.V))) + "\n"
-        s += "Terminals = " + ", ".join(map(str, sorted(self.T))) + "\n"
-        s += "Productions = {\n"
-        for var in sorted(self.V):
-            for string in sorted(self.P[var]):
-                s += f"    {var} \t-> {string}\n"
-        s += "}\n"
-        s += f"Start = {self.S}"
-        return s
-    
-    @property
-    def invP(self):
-        if not hasattr(self, "_invP"):
-            # Inverse of P
-            self._invP = multimap()
-            for var, string in self.P.flat_items():
-                self._invP[string].add(var)
-        return self._invP
-    
-    @property
-    def symbols(self):
-        if not hasattr(self, "_symbols"):
-            self._symbols = self.V | self.T
-        return self._symbols
-    
+class Expression:
+    pass
 
+@dataclass
+class Summation(Expression):
+    a: Expression
+    b: Expression
 
-def double(it):
-    for i in it:
-        yield i, i
+@dataclass
+class Multiplication(Expression):
+    a: Expression
+    b: Expression
 
-
-class ParserSet:
-    def _init_dict(self):
-        self.dct = defaultdict(set)
-    
-    def __init__(self, G: Grammar):
-        self.G = G
-        self._init_dict()
-        
-        while True:
-            old_dct = {k: v.copy() for k,v in self.dct.items()}
-            self._step()
-            if self.dct == old_dct:
-                break
-    
-    def __call__(self, what):
-        return self.dct[what]
-    
-    def print_vars(self):
-        for var in sorted(self.G.V):
-            print("    {}: {}".format(var, oset(self.dct[var])))
-
-
-class FIRST(ParserSet):
-    def _init_dict(self):
-        super()._init_dict()
-        self.dct[epsilon] = {epsilon}
-        for term in self.G.T: 
-            self.dct[term] = {term}
-    
-    def __call__(self, what):
-        if what in self.dct:
-            return self.dct[what]
-        
-        assert isinstance(what, TokenString)
-        
-        if len(what) == 1:
-            return self(what[0])  # Important :)
-        
-        assert len(what) > 1
-        
-        res = self.dct[what[0]]
-        if epsilon in res:
-            res = (res - {epsilon}) | self(what[1:])
-        self.dct[what] = res
-        return res
-    
-    def _step(self):
-        for X, string in chain(self.G.P.flat_items()):
-            if string != epsilon:
-                self.dct[X].update(self.dct[string[0]] - {epsilon})
-            for i in range(len(string)-1):
-                Y1 = string[i]
-                Y2 = string[i+1]
-                if epsilon in self.dct[Y1]:
-                    self.dct[X].update(self.dct[Y2] - {epsilon})
-            if all(epsilon in self.dct[Y] for Y in string):
-                self.dct[X].add(epsilon)
-
-
-class FOLLOW(ParserSet):
-    def __init__(self, G: Grammar, first = None):
-        if first is None:
-            first = FIRST(G)
-        self.first = first
-        super().__init__(G)
-    
-    def _init_dict(self):
-        super()._init_dict()
-        self.dct[self.G.S].add(EOS)
-    
-    def _step(self):
-        for var, string in self.G.P.flat_items():
-            for i, A in enumerate(string):
-                if A in self.G.V:
-                    # alpha = string[:i]
-                    beta = string[i+1:]
-                    
-                    if len(beta) > 0:
-                        self.dct[A].update(self.first(beta) - {epsilon})
-                    else:
-                        self.dct[A].update(self.dct[var])
-                    if epsilon in self.first(beta):
-                        self.dct[A].update(self.dct[var])
-    
-
-class LLParser:
-    def __init__(self, G: Grammar, debug = False):
-        self.G = G
-        
-        if debug:
-            print(">>> Builing LL(1) Table")
-        
-        first = FIRST(G)
-        follow = FOLLOW(G, first=first)
-        
-        if debug:
-            print(" >> FIRST:")
-            first.print_vars()
-            print(" >> FOLLOW:")
-            follow.print_vars()
-        
-        table = defaultdict(multimap)
-        
-        for var, string in G.P.flat_items():
-            for symb in first(string):
-                if symb == epsilon:
-                    for term in follow(var):
-                        table[var][term].add(string)
-                else:  # symb is a terminal
-                    table[var][symb].add(string)
-        
-        try:
-            self.table = {k: v.flatten() for k, v in table.items()}
-            print(">>> Table is built.\n")
-        except NotFlat as e:
-            raise Exception("Language is not LL(1)") from e
-    
-        
-    
-    def __str__(self):
-        terminals = sorted(self.G.T, key=str) + [EOS]
-        variables = sorted(self.G.V, key=str)
-        
-        columns = []
-        for i in range(len(self.G.T) + 2):  # row headers and EOS
-            columns.append([""] * (len(self.G.V) + 1))
-        
-        # Headers
-        columns[0] = [""] + list(map(str, variables))
-        for i in range(1, len(columns)):
-            columns[i][0] = str(terminals[i-1])
-        
-        # Rest of the data
-        for _c, term in enumerate(terminals):
-            c = _c + 1
-            for _r, var in enumerate(variables):
-                r = _r + 1
-                columns[c][r] = str(self.table[var].get(term, ""))
-        
-        col_lengths = [max(map(len, ln)) for ln in columns]
-        
-        lines = []
-        line = []
-        for c in range(len(columns)):
-            val = columns[c][0]
-            line.append(val.ljust(col_lengths[c]))
-        lines.append("  " + "  | ".join(line) + "  |")
-        horizontal_line = "|-" + "--|-".join("-"*col_lengths[i] for i in range(len(columns))) + "--|"
-        lines.append(horizontal_line)
-        for r in range(1, len(columns[0])):
-            line = []
-            for c in range(len(columns)):
-                val = columns[c][r]
-                line.append(val.ljust(col_lengths[c]))
-            lines.append("| " + "  | ".join(line) + "  |")
-        lines.append(horizontal_line)
-        
-        return "\n".join(lines)
-    
-    def parse(self, s: TokenString):
-        to_parse = list(s) + [EOS]
-        parsed = []
-        tree = self._parse(to_parse, parsed, self.G.S)
-        if to_parse != [EOS]:
-            raise Exception("Not all input was processed")
-        return tree
-    
-    def _parse(self, to_parse, parsed, var):
-        children = []
-        string = self.table[var].get(to_parse[0])
-        if string is None:
-            raise Exception(f"String did not satisfy language (variable {var}, already parsed {parsed})")
-        for symb in string:
-            if symb in self.G.T:
-                children.append(symb)
-                parsed.append(to_parse.pop(0))
-            else:
-                children.append(self._parse(to_parse, parsed, symb))
-        return Tree(var, children)
-
-
-class Tree:
-    def __init__(self, content, children = []):
-        self.content = content
-        self.children = children
-    
-    def __str__(self):
-        return "(" + str(self.content) + " " + " ".join(map(str, self.children)) + ")"
 
 
 if __name__ == "__main__":
-    
-    print("TOKENIZE")
-    print(tokenize("if iszero? (x) then let x = 1 in x + 1 else x + (x * 2)"))
-    
-    def Str(*l):
-        return TokenString(l)
-    
-    #G = Grammar({"S", "M", "N"}, {"a", "b", "z"},
-            #multimap({"S": {String("zMNz")}, "M": {String("aMa"), String("z")}, "N": {String("bNb"), String("z")}}), "S")
-    
-    #G = Grammar({"S"}, {"x", "y"},
-            #multimap({"S": {String("xSy"), epsilon}}), "S")
             
     # E -> ( E )
     # E -> id
@@ -362,8 +114,7 @@ if __name__ == "__main__":
     # M -> E * E
     # E -> M
     
-    
-    grammar = r"""
+    gram = r"""
     E: '(' E ')' | S | M | number;
     S: E '+' E {left, 1};
     M: E '*' E {left, 2};
@@ -372,25 +123,55 @@ if __name__ == "__main__":
     number: /\d+/;
     """
     
-    from parglare import Parser, Grammar
+    from parglare import *
+    from parglare.grammar import Production, ProductionRHS, ASSOC_NONE, ASSOC_LEFT, ASSOC_RIGHT, RegExRecognizer, StringRecognizer
     
-    g = Grammar.from_string(grammar)
-    parser = Parser(g)
+    names = {
+        Expression: 'E',
+        Summation: 'S',
+        Multiplication: 'M',
+    }
+    
+    E = NonTerminal(names[Expression])
+    S = NonTerminal(names[Summation])
+    M = NonTerminal(names[Multiplication])
+    number = Terminal('number', RegExRecognizer(r"\d+"))
+    
+    all_terminals = set()
+    def t(s):
+        res = Terminal(s, StringRecognizer(s))
+        all_terminals.add(res)
+        return res
+    
+    prods = [
+        Production(E, ProductionRHS([t('('), E, t(')')])),
+        Production(E, ProductionRHS([S])),
+        Production(E, ProductionRHS([M])),
+        Production(E, ProductionRHS([number])),
+        
+        Production(S, ProductionRHS([E, t('+'), E])),
+        
+        Production(M, ProductionRHS([E, t('*'), E]))
+    ]
+    
+    g = Grammar.from_string(gram)
+    g2 = Grammar(productions=prods, terminals=list(all_terminals), start_symbol=names[Expression])
+    def skip(p, nodes):
+        print("skipping", p, nodes)
+        return nodes[0]
+    
+    parser = Parser(g2, actions={
+        'E': [
+            skip,
+            skip,
+            skip,
+            lambda _, nodes: (print(f"integer {nodes}"), int(nodes[0]))[1],
+        ],
+        'S': [lambda _, nodes: (print(f"sum {nodes}"), Summation(nodes[0], nodes[2]))[1]],
+        'M': [lambda _, nodes: (print(f"mult {nodes}"), Multiplication(nodes[0], nodes[2]))[1]],
+    })
     res = parser.parse("34 + 2 * 4")
     print("RESULT", res)
-    
-    """
-    P = multimap({
-        "E": {Str("(", "E", ")"), Str("id"), Str("S"), Str("M")},
-        "S": {Str("E", "+", "E")},
-        "M": {Str("E", "*", "E")},
-    })
-    
-    G = Grammar({"E", "S", "M"}, {"+", "*", "(", ")", "id"}, P, "E")
-    
-    print(G)
-    parser = LLParser(G)
-    print(parser)
-    tree = parser.parse(Str("id", "+", "id", "*", "id"))
-    print(tree)
-    """
+    import pdb
+    pdb.set_trace()
+
