@@ -199,10 +199,8 @@ class Language:
         grammar = Grammar(productions=prods, terminals=[], start_symbol=get_name(start))
         return grammar, actions
 
-    def add_types(self, *extra_types, start=None):
-        if start is None:
-            start = self.start
-        return type(self)(start, *(self.types + extra_types))
+    def add_types(self, *extra_types):
+        return type(self)(*self.types, *extra_types)
 
     def parse(self, text):
         return self.parser.parse(text)
