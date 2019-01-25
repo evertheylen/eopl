@@ -1,18 +1,22 @@
 
 import operator
-from collections import ChainMap
 from dataclasses import dataclass
 
+from eopl.base import *
 from eopl.parser import *
 
+
+
+# LET: A Simple Language
+# ===============================================
 
 def make_binary_operator(_name, _cls, _op, _func, _priority, _assoc='left'):
     def f(name=_name, cls=_cls, op=_op, func=_func, priority=_priority, assoc=_assoc):
         @generates(Field('a', cls), op, Field('b', cls), assoc=assoc, priority=priority)
         @replaces(cls)
         class Operator(BaseExpr):
-            def evaluate(self, **kw):
-                return func(self.a.evaluate(**kw), self.b.evaluate(**kw))
+            def evaluate(self, ctx):
+                return func(self.a.evaluate(ctx), self.b.evaluate(ctx))
         Operator.__name__ = name
         Operator.__qualname__ = name
         return Operator
@@ -24,22 +28,12 @@ def make_unary_operator(_name, _cls, _op, _func, _priority):
         @generates(op, Field('a', cls), priority=priority)
         @replaces(cls)
         class Operator(BaseExpr):
-            def evaluate(self, **kw):
-                return func(self.a.evaluate(**kw))
+            def evaluate(self, ctx):
+                return func(self.a.evaluate(ctx))
         Operator.__name__ = name
         Operator.__qualname__ = name
         return Operator
     return f()
-
-
-class Environment(ChainMap):
-    layer = ChainMap.new_child
-
-
-class BaseExpr:
-    def free_vars(self):
-        for v in vars(self).values():
-            yield from v.free_vars()
 
 
 @skip('(', THIS, ')')
@@ -50,8 +44,8 @@ class Expression(BaseExpr):
 @generates(Field('expr', Expression))
 class LetProgram:
     def evaluate(self):
-        env = Environment()
-        return self.expr.evaluate(env=env)
+        ctx = Context()
+        return self.expr.evaluate(ctx)
     
 
 @generates(Field('val', Number))
@@ -59,7 +53,7 @@ class LetProgram:
 @generates(Field('val', String))
 @replaces(Expression)
 class Constant(BaseExpr):
-    def evaluate(self, **kw):
+    def evaluate(self, ctx):
         return self.val
     
     def free_vars(self):
@@ -69,8 +63,10 @@ class Constant(BaseExpr):
 @generates(Field('name', RawIdentifier))
 @replaces(Expression)
 class Identifier(BaseExpr):
-    def evaluate(self, *, env, **kw):
-        return env[self.name]
+    def evaluate(self, ctx):
+        if self.name not in ctx.env:
+            raise Exception(f"Couldn't find {self.name} in:\n{pretty(ctx.env)}")
+        return ctx.env[self.name]
 
     def free_vars(self):
         yield self.name
@@ -79,19 +75,19 @@ class Identifier(BaseExpr):
 @generates('let', Field('var', RawIdentifier), '=', Field('value', Expression), 'in', Field('expr', Expression))
 @replaces(Expression)
 class LetExpr(BaseExpr):
-    def evaluate(self, *, env, **kw):
-        new_env = env.layer({self.var: self.value.evaluate(env=env, **kw)})
-        return self.expr.evaluate(env=new_env, **kw)
+    def evaluate(self, ctx):
+        sub_ctx = ctx.with_layer({self.var: self.value.evaluate(ctx)})
+        return self.expr.evaluate(sub_ctx)
 
 
 @generates('if', Field('cond', Expression), 'then', Field('true', Expression), 'else', Field('false', Expression))
 @replaces(Expression)
 class IfExpr(BaseExpr):
-    def evaluate(self, **kw):
-        if self.cond.evaluate(**kw):
-            return self.true.evaluate(**kw)
+    def evaluate(self, ctx):
+        if self.cond.evaluate(ctx):
+            return self.true.evaluate(ctx)
         else:
-            return self.false.evaluate(**kw)
+            return self.false.evaluate(ctx)
 
 
 Neg = make_unary_operator('Neg', Expression, '-', operator.neg, 1300)
@@ -125,42 +121,60 @@ basics = [Expression, Constant, Identifier, *math_ops, *comp_ops, *logic_ops]
 LET = Language(LetProgram, LetExpr, IfExpr, *basics)
 
 
+
+# PROC: A Language with Procedures
+# ================================
+
 @dataclass
-class Procedure:
-    bound: dict
+class DynamicProcedure:
     argname: str
     body: Expression
     
-    def call(self, arg, *, env, **kw):
-        new_env = env.layer(self.bound).layer({self.argname: arg})
-        return self.body.evaluate(env=new_env, **kw)
+    def call(self, arg, ctx):
+        call_ctx = ctx.with_layer({self.argname: arg})
+        return self.body.evaluate(call_ctx)
+
+
+@dataclass
+class Procedure(DynamicProcedure):
+    bound: dict
+    
+    def call(self, arg, ctx):
+        call_ctx = Context().with_layer(self.bound).with_layer({self.argname: arg})
+        return self.body.evaluate(call_ctx)
 
 
 @generates('proc', '(', Field('arg', RawIdentifier), ')', Field('body', Expression))
 @replaces(Expression)
-class ProcExpr(BaseExpr):
-    def evaluate(self, *, env, **kw):
-        bound = {v: env[v] for v in self.free_vars()}
-        return Procedure(bound, self.arg, self.body)
+class DynProcExpr(BaseExpr):
+    def evaluate(self, ctx):
+        return DynamicProcedure(self.arg, self.body)
         
-    
     def free_vars(self):
         for v in self.body.free_vars():
             if v != self.arg:
                 yield v
-            
 
 
-@generates('(', Field('proc', Expression), Field('arg', Expression), ')')
+class ProcExpr(DynProcExpr):
+    def evaluate(self, ctx):
+        bound = {v: ctx.env[v] for v in self.free_vars()}
+        return Procedure(self.arg, self.body, bound)
+
+
+# TODO: Slight parser problem: the original definition (f arg) confuses
+# infix operators with function calls...
+@generates(Field('proc', Expression), '(', Field('arg', Expression), ')')
 @replaces(Expression)
 class CallExpr(BaseExpr):
-    def evaluate(self, *, env, **kw):
-        proc = self.proc.evaluate(env=env, **kw)
-        arg = self.arg.evaluate(env=env, **kw)
-        return proc.call(arg, env=env, **kw)
+    def evaluate(self, ctx):
+        proc = self.proc.evaluate(ctx)
+        arg = self.arg.evaluate(ctx)
+        return proc.call(arg, ctx)
     
 
 PROC = LET.add_types(ProcExpr, CallExpr)
+DYNPROC = LET.add_types(DynProcExpr, CallExpr)
 
 
 # Tests
@@ -195,20 +209,38 @@ class TestProc(unittest.TestCase):
         s = """
         let a = 5 in
         let f = proc (b) a+b in
-        (f 3)
+        f(3)
         """
         res = PROC.parse(s).evaluate()
         self.assertEqual(res, 8)
     
     def test_complex(self):
         s = """
-        let chain = proc(f1) proc(f2) proc(x) (f2 (f1 x)) in
+        let chain = proc(f1) proc(f2) proc(x) f2(f1(x)) in
         let add_one = proc(x) x+1 in
         let mult_two = proc(x) x*2 in
-        (((chain add_one) mult_two) 5)
+        chain(add_one)(mult_two)(5)
         """
         res = PROC.parse(s).evaluate()
         self.assertEqual(res, 12)
+    
+    def test_exam_static(self):
+        s = """
+        let f = proc(x) 1 in
+            let f = proc(y) if y == 0 then 0 else f(y-1) in
+                f(2)
+        """
+        res = PROC.parse(s).evaluate()
+        self.assertEqual(res, 1)
+    
+    def test_exam_dynamic(self):
+        s = """
+        let f = proc(x) 1 in
+            let f = proc(y) if y == 0 then 0 else f(y-1) in
+                f(2)
+        """
+        res = DYNPROC.parse(s).evaluate()
+        self.assertEqual(res, 0)
 
 
 if __name__ == '__main__':

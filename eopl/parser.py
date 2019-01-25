@@ -33,11 +33,14 @@ class AbstractProduction:
     def __post_init__(self):
         assert self.assoc in ['left', 'right', 'none']
     
-    def to_parglare(self, get_symbol):
-        head = get_symbol(self.head)
-        body = ProductionRHS([get_symbol(s) for s in self.body])
+    def to_parglare(self, defining_type, get_symbol):
+        head = get_symbol(defining_type if self.head is None else self.head)
+        body = ProductionRHS([get_symbol(defining_type if s is None else s) for s in self.body])
         assoc = {'none': ASSOC_NONE, 'left': ASSOC_LEFT, 'right': ASSOC_RIGHT}[self.assoc]
         return Production(symbol=head, rhs=body, assoc=assoc, prior=self.priority)
+    
+    def make_action(self, defining_type):
+        return self.action(defining_type)
 
 
 @dataclass(frozen=True)
@@ -65,9 +68,9 @@ def skip(*symbols, **kwargs):
             raise Exception("@skip needs exactly one mention of 'None' aka THIS")
         index = symbols.index(None)
         cls._productions.append(AbstractProduction(
-            head=cls,
-            body=[(cls if s is None else s) for s in symbols],
-            action=lambda _, nodes, _index=index: nodes[_index],
+            head=None,
+            body=symbols,  # [(cls if s is None else s) for s in symbols],
+            action=lambda _: lambda _, nodes, _index=index: nodes[_index],
             **kwargs))
         return cls
     return f
@@ -88,17 +91,19 @@ def generates(*symbols, **kwargs):
             cls = make_dataclass(cls.__name__, 
                                  [f.make_dc_field() for f in fields.values()],
                                  bases=(cls,))
-            cls._orig_type = orig_cls
+            #cls._orig_type = orig_cls
             
         elif fields.keys() != cls._fields.keys():
             # TODO check defaults
             raise Exception("Fields on class differ!")
         
-        def action(_, nodes, cls=cls, field_index=field_index):
-            return cls(**{name: nodes[i] for name, i in field_index.items()})
+        def action(cls, field_index=field_index):
+            def _action(_, nodes, cls=cls, field_index=field_index):
+                return cls(**{name: nodes[i] for name, i in field_index.items()})
+            return _action
         
         raw_symbols = [(s.type if isinstance(s, Field) else s) for s in symbols]
-        cls._productions.append(AbstractProduction(cls, raw_symbols, action, **kwargs))
+        cls._productions.append(AbstractProduction(None, raw_symbols, action, **kwargs))
         return cls
     return f
 
@@ -106,7 +111,7 @@ def generates(*symbols, **kwargs):
 def replaces(from_cls, **kwargs):
     def f(cls):
         add_tags(cls)
-        cls._productions.append(AbstractProduction(from_cls, [cls], action=lambda _, nodes: nodes[0], **kwargs))
+        cls._productions.append(AbstractProduction(from_cls, [None], action=lambda _: lambda _, nodes: nodes[0], **kwargs))
         return cls
     return f
 
@@ -162,6 +167,7 @@ class Language:
             name = f"t{i}_{t.__name__}"
             names[t] = name
             symbols[t] = NonTerminal(name)
+            
             # @generates replaces the original class by a dataclass
             # so if something refers to the original one we need to
             # fix that! (eg. a @skips decorator)
@@ -189,9 +195,9 @@ class Language:
         for t in types:
             name = get_name(t)
             for ap in t._productions:
-                prod = ap.to_parglare(get_symbol)
+                prod = ap.to_parglare(t, get_symbol)
                 prods.append(prod)
-                actions[prod.symbol.name].append(ap.action)
+                actions[prod.symbol.name].append(ap.make_action(t))
         
         prods += _layout_prods
         actions.update(_default_actions)
