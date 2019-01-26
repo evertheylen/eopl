@@ -1,4 +1,5 @@
 
+from pprint import PrettyPrinter
 from collections import defaultdict
 
 
@@ -33,3 +34,26 @@ class multimap(defaultdict):
                 raise NotFlat(v)
             d[k] = v.pop()
         return d
+
+
+def lazyprop(fn):
+    attr_name = '_lazy_' + fn.__name__
+    @property
+    def _lazyprop(self):
+        if not hasattr(self, attr_name):
+            setattr(self, attr_name, fn(self))
+        return getattr(self, attr_name)
+    return _lazyprop
+    
+
+_pretty_printer = PrettyPrinter(indent=2, width=100)
+
+
+def pprint(x):
+    _pretty_printer.pprint(x)
+
+
+def pretty(x):
+    return _pretty_printer.pformat(x)
+
+

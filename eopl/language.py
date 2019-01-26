@@ -11,8 +11,8 @@ from parglare.grammar import Production, ProductionRHS, Terminal, NonTerminal, G
 
 from eopl.util import multimap
 
-__all__ = ('Field', 'skip', 'THIS', 'generates', 'replaces', 
-           'Number', 'Boolean', 'String', 'RawIdentifier', 'Language')
+__all__ = ('Field', 'skip', 'THIS', 'generates', 'replaces', 'upgrades', 'make_list',
+           'Number', 'Boolean', 'String', 'RawIdentifier', 'Language', 'Start')
 
 
 # Declare Grammar
@@ -20,6 +20,10 @@ __all__ = ('Field', 'skip', 'THIS', 'generates', 'replaces',
 
 
 Action = Callable[[Any, list], Any]
+
+
+class Start:
+    pass
 
 
 @dataclass
@@ -54,9 +58,10 @@ class Field:
 
 
 def add_tags(cls):
-    if not hasattr(cls, '_productions'):
-        cls._productions = []
-        cls._fields = None
+    if '_productions' not in vars(cls):
+        setattr(cls, '_productions', getattr(cls, '_productions', []).copy())
+        setattr(cls, '_fields', getattr(cls, '_fields', None))
+        setattr(cls, '_upgrade_from', getattr(cls, '_upgrade_from', []).copy())
 
 
 THIS = None
@@ -116,6 +121,39 @@ def replaces(from_cls, **kwargs):
     return f
 
 
+def upgrades(from_cls):
+    def f(cls):
+        add_tags(cls)
+        cls._upgrade_from.append(from_cls)
+        return cls
+    return f
+
+
+@dataclass(frozen=True)
+class TempSymbol:
+    name: str
+
+
+def make_list(t, divider, empty=False):
+    def f(cls):
+        add_tags(cls)
+        helper_symb = TempSymbol(f"_list_{cls.__name__}_{t.__name__}")
+        # TODO: prevent other productions?
+        
+        # Forward the list
+        cls._productions.append(AbstractProduction(None, [helper_symb], action=lambda _cls: lambda _, nodes: _cls(nodes[0])))
+        
+        if empty:  # empty list
+            cls._productions.append(AbstractProduction(helper_symb, [], action=lambda _: lambda _, nodes: []))
+        # single member
+        cls._productions.append(AbstractProduction(helper_symb, [t], action=lambda _: lambda _, nodes: [nodes[0]]))
+        #cls._productions.append(AbstractProduction(helper_symb, [t, divider], action=lambda _: lambda _, nodes: [nodes[0]]))
+        # two members
+        cls._productions.append(AbstractProduction(helper_symb, [t, divider, helper_symb],
+                                                   action=lambda _: lambda _, nodes: [nodes[0]] + nodes[2]))
+        return cls
+    return f
+
 
 # Grammar extra's
 # ===============================================
@@ -129,6 +167,7 @@ _default_actions = {
 
 Number = Terminal('Number', RegExRecognizer(r"\d+"))
 Boolean = Terminal('Boolean', RegExRecognizer(r"(true|false)"))
+Boolean.prior = 100
 String = Terminal('String', RegExRecognizer(r'".*"'))
 RawIdentifier = Terminal('RawIdentifier', RegExRecognizer(r'[A-Za-z_][A-Za-z0-9_]*'))
 
@@ -152,8 +191,27 @@ _default_symbols = [Number, Boolean, String, RawIdentifier, _comment]
 
 class Language:
     def __init__(self, *types):
-        self.start = types[0]
-        self.types = list(types)
+        types = list(types)
+        upgrade_map = {}
+        for t in types:
+            for repl in t._upgrade_from:
+                if repl in upgrade_map:
+                    raise Exception(f"Can't upgrade {repl} both to {upgrade_map[repl]} and {t}")
+                upgrade_map[repl] = t
+        
+        # Keep the order, but don't allow duplicate types
+        self.types = []
+        added = set()
+        for t in types:
+            actual_t = upgrade_map.get(t, t)
+            if actual_t not in added:
+                added.add(actual_t)
+                self.types.append(actual_t)
+            
+        start_types = [t for t in self.types if issubclass(t, Start)]
+        if len(start_types) != 1:
+            raise Exception(f"There was no unique starting NonTerminal (instead got {start_types})")
+        self.start = start_types[0]
             
         self.grammar, self.actions = self.make_grammar(self.start, self.types)
         self.parser = Parser(self.grammar, actions=self.actions)
@@ -167,6 +225,9 @@ class Language:
             name = f"t{i}_{t.__name__}"
             names[t] = name
             symbols[t] = NonTerminal(name)
+            for repl in t._upgrade_from:
+                names[repl] = name
+                symbols[repl] = symbols[t]
             
             # @generates replaces the original class by a dataclass
             # so if something refers to the original one we need to
@@ -176,7 +237,7 @@ class Language:
                 symbols[t._orig_type] = symbols[t]
         
         def get_name(symb):
-            if isinstance(symb, GrammarSymbol):
+            if isinstance(symb, (GrammarSymbol, TempSymbol)):
                 return symb.name
             elif isinstance(symb, str):
                 return symb
@@ -187,7 +248,14 @@ class Language:
                 return symb
             elif isinstance(symb, str):
                 return Terminal(symb, StringRecognizer(symb))
-            return symbols[symb]
+            try:
+                return symbols[symb]
+            except KeyError as e:
+                if isinstance(symb, TempSymbol):
+                    symbols[symb] = NonTerminal(symb.name)
+                    return symbols[symb]
+                else:
+                    raise e
         
         # Productions and actions
         prods = []
@@ -201,7 +269,6 @@ class Language:
         
         prods += _layout_prods
         actions.update(_default_actions)
-        
         grammar = Grammar(productions=prods, terminals=[], start_symbol=get_name(start))
         return grammar, actions
 

@@ -2,8 +2,9 @@
 import operator
 from dataclasses import dataclass
 
+from eopl.util import *
 from eopl.base import *
-from eopl.parser import *
+from eopl.language import *
 
 
 
@@ -42,7 +43,7 @@ class Expression(BaseExpr):
 
 
 @generates(Field('expr', Expression))
-class LetProgram:
+class LetProgram(Start):
     def evaluate(self):
         ctx = Context()
         return self.expr.evaluate(ctx)
@@ -72,12 +73,39 @@ class Identifier(BaseExpr):
         yield self.name
 
 
-@generates('let', Field('var', RawIdentifier), '=', Field('value', Expression), 'in', Field('expr', Expression))
+@generates(Field('var', RawIdentifier), '=', Field('value', Expression))
+class Assignment:
+    def free_vars(self):
+        yield from self.value.free_vars()
+
+
+@make_list(Assignment, ';')
+class AssignmentList(list):
+    def free_vars(self):
+        for assignment in self:
+            yield from assignment.free_vars()
+
+
+@generates('let', Field('assignments', AssignmentList), 'in', Field('expr', Expression))
 @replaces(Expression)
 class LetExpr(BaseExpr):
     def evaluate(self, ctx):
-        sub_ctx = ctx.with_layer({self.var: self.value.evaluate(ctx)})
+        sub_ctx = ctx.with_layer({ass.var: ctx.wrap(ass.value.evaluate(ctx))
+                                  for ass in self.assignments})
         return self.expr.evaluate(sub_ctx)
+    
+    def free_vars(self):
+        yield from self.assignments.free_vars()
+        for v in self.expr.free_vars():
+            if v not in self.names:
+                yield v
+    
+    @lazyprop
+    def names(self):
+        return {a.var for a in self.assignments}
+    
+
+let_exprs = [Assignment, AssignmentList, LetExpr]
 
 
 @generates('if', Field('cond', Expression), 'then', Field('true', Expression), 'else', Field('false', Expression))
@@ -118,7 +146,7 @@ logic_ops = [And, Or, Not]
 
 basics = [Expression, Constant, Identifier, *math_ops, *comp_ops, *logic_ops]
 
-LET = Language(LetProgram, LetExpr, IfExpr, *basics)
+LET = Language(LetProgram, IfExpr, *let_exprs, *basics)
 
 
 
@@ -131,6 +159,7 @@ class DynamicProcedure:
     body: Expression
     
     def call(self, arg, ctx):
+        # arg should already be wrapped!
         call_ctx = ctx.with_layer({self.argname: arg})
         return self.body.evaluate(call_ctx)
 
@@ -140,7 +169,8 @@ class Procedure(DynamicProcedure):
     bound: dict
     
     def call(self, arg, ctx):
-        call_ctx = Context().with_layer(self.bound).with_layer({self.argname: arg})
+        # arg should already be wrapped!
+        call_ctx = ctx.clean_env().with_layer(self.bound).with_layer({self.argname: arg})
         return self.body.evaluate(call_ctx)
 
 
@@ -162,19 +192,60 @@ class ProcExpr(DynProcExpr):
         return Procedure(self.arg, self.body, bound)
 
 
-# TODO: Slight parser problem: the original definition (f arg) confuses
-# infix operators with function calls...
-@generates(Field('proc', Expression), '(', Field('arg', Expression), ')')
+# This grammar fits the rest better than (f a)
+@generates(Field('proc', Expression), '(', Field('arg', Expression), ')', priority=2000)
 @replaces(Expression)
 class CallExpr(BaseExpr):
     def evaluate(self, ctx):
         proc = self.proc.evaluate(ctx)
         arg = self.arg.evaluate(ctx)
-        return proc.call(arg, ctx)
+        return proc.call(ctx.wrap(arg), ctx)
     
 
 PROC = LET.add_types(ProcExpr, CallExpr)
 DYNPROC = LET.add_types(DynProcExpr, CallExpr)
+
+
+
+# LETREC: A Language with Recursive Procedures
+# ===============================================
+
+
+@generates(Field('pname', RawIdentifier), '(', Field('arg', RawIdentifier), ')', '=', Field('body', Expression))
+class LetRecDecl:
+    def get_proc(self, ctx, pnames):
+        not_free = set(pnames)
+        not_free.add(self.arg)
+        bound = {v: ctx.env[v] for v in self.body.free_vars() if v not in not_free}
+        return Procedure(self.arg, self.body, bound)
+
+
+@make_list(LetRecDecl, ';')
+class LetRecDeclList(list):
+    pass
+
+
+@generates('letrec', Field('decls', LetRecDeclList), 'in', Field('expr', Expression))
+@replaces(Expression)
+class LetRecExpr(BaseExpr):
+    def evaluate(self, ctx):
+        names = [decl.pname for decl in self.decls]
+        procs = {decl.pname: decl.get_proc(ctx, names) for decl in self.decls}
+        wrapped_procs = {k: ctx.wrap(v) for k, v in procs.items()}
+        for p in procs.values():
+            p.bound.update(wrapped_procs)
+        
+        sub_ctx = ctx.with_layer(wrapped_procs)
+        return self.expr.evaluate(sub_ctx)
+        
+    def free_vars(self):
+        for v in self.expr.free_vars():
+            if v != self.pname:
+                yield v
+
+
+LETREC = PROC.add_types(LetRecExpr, LetRecDeclList, LetRecDecl)
+
 
 
 # Tests
@@ -216,9 +287,9 @@ class TestProc(unittest.TestCase):
     
     def test_complex(self):
         s = """
-        let chain = proc(f1) proc(f2) proc(x) f2(f1(x)) in
-        let add_one = proc(x) x+1 in
-        let mult_two = proc(x) x*2 in
+        let chain = proc(f1) proc(f2) proc(x) f2(f1(x));
+           add_one = proc(x) x+1;
+           mult_two = proc(x) x*2 in
         chain(add_one)(mult_two)(5)
         """
         res = PROC.parse(s).evaluate()
@@ -241,6 +312,28 @@ class TestProc(unittest.TestCase):
         """
         res = DYNPROC.parse(s).evaluate()
         self.assertEqual(res, 0)
+
+
+class TestLetRec(unittest.TestCase):
+    def test_fib(self):
+        s = """
+        letrec fib(i) = 
+            if i == 0 then 0 else 
+            if i == 1 then 1 else
+            fib(i-1) + fib(i-2)
+        in fib(10)
+        """
+        res = LETREC.parse(s).evaluate()
+        self.assertEqual(res, 55)
+    
+    def test_mutual(self):
+        s = """
+        letrec even(i) = if i == 0 then true else if i == -1 then false else odd(i-1);
+               odd(i) =  if i == 0 then false else if i == 0 then true else even(i-1)
+        in even(7)
+        """
+        res = LETREC.parse(s).evaluate()
+        self.assertEqual(res, False)
 
 
 if __name__ == '__main__':
